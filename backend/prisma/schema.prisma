@@ -1,0 +1,58 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                      String    @id @default(uuid())
+  name                    String
+  email                   String    @unique
+  password                String?
+  googleId                String?   @unique
+  profilePicture          String?   @default("")
+  age                     Int?
+  skinType                String?   @default("")
+  medicalConditions       String?   @default("")
+  createdAt               DateTime  @default(now())
+  isDarkMode              Boolean   @default(false)
+  resetPasswordOTP        String?
+  resetPasswordOTPExpires DateTime?
+  tokenVersion            Int       @default(0)
+
+  lesions                 Lesion[]
+}
+
+model Lesion {
+  id             String    @id @default(uuid())
+  userId         String
+  name           String
+  bodyLocation   String
+  latestRisk     String    @default("none")
+  firstDetected  DateTime  @default(now())
+  lastScan       DateTime  @default(now())
+  notes          String?   @default("")
+  imagePath      String?
+  reminderDate   DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scanHistory    ScanEntry[]
+}
+
+model ScanEntry {
+  id             String    @id @default(uuid())
+  lesionId       String
+  date           DateTime  @default(now())
+  riskLevel      String
+  confidence     Float
+  explanation    String?
+  recommendation String?
+  imagePath      String?
+
+  lesion         Lesion    @relation(fields: [lesionId], references: [id], onDelete: Cascade)
+}
