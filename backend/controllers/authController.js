@@ -1,5 +1,4 @@
-const User = require('../models/User');
-const Lesion = require('../models/Lesion');
+const { prisma } = require('../db');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
@@ -39,20 +38,26 @@ const registerUser = async (req, res) => {
       return res.status(400).json({ message: 'Please add all fields' });
     }
 
-    const userExists = await User.findOne({ email });
+    const userExists = await prisma.user.findUnique({ where: { email } });
 
     if (userExists) {
       return res.status(400).json({ message: 'User already exists' });
     }
 
-    const user = await User.create({
-      name,
-      email,
-      password,
+    // Hash the password manually
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    const user = await prisma.user.create({
+      data: {
+        name,
+        email,
+        password: hashedPassword,
+      }
     });
 
     if (user) {
-      const { accessToken, refreshToken } = generateTokens(user._id, user.tokenVersion);
+      const { accessToken, refreshToken } = generateTokens(user.id, user.tokenVersion);
       res.status(201).json({
         _id: user.id,
         name: user.name,
@@ -80,10 +85,10 @@ const loginUser = async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const user = await User.findOne({ email });
+    const user = await prisma.user.findUnique({ where: { email } });
 
     if (user && user.password && (await bcrypt.compare(password, user.password))) {
-      const { accessToken, refreshToken } = generateTokens(user._id, user.tokenVersion);
+      const { accessToken, refreshToken } = generateTokens(user.id, user.tokenVersion);
       res.json({
         _id: user.id,
         name: user.name,
@@ -115,10 +120,10 @@ const refreshAccessToken = async (req, res) => {
 
   try {
     const decoded = jwt.verify(refreshToken, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.id);
+    const user = await prisma.user.findUnique({ where: { id: decoded.id } });
     if (!user) return res.status(401).json({ message: 'User not found' });
 
-    const tokens = generateTokens(user._id, user.tokenVersion);
+    const tokens = generateTokens(user.id, user.tokenVersion);
     res.json({
       token: tokens.accessToken,
       refreshToken: tokens.refreshToken,
@@ -133,39 +138,44 @@ const refreshAccessToken = async (req, res) => {
 // @access  Private
 const updateUser = async (req, res) => {
   try {
-    const user = await User.findById(req.user.id);
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    const { name, email, password, age, skinType, medicalConditions } = req.body;
+    const { name, email, password, age, skinType, medicalConditions, isDarkMode } = req.body;
 
-    if (name) user.name = name;
-    if (email) user.email = email;
-    if (age) user.age = age;
-    if (skinType) user.skinType = skinType;
-    if (medicalConditions) user.medicalConditions = medicalConditions;
-    if (req.body.isDarkMode !== undefined) user.isDarkMode = req.body.isDarkMode;
+    const updateData = {};
+    if (name) updateData.name = name;
+    if (email) updateData.email = email;
+    if (age !== undefined) updateData.age = age;
+    if (skinType !== undefined) updateData.skinType = skinType;
+    if (medicalConditions !== undefined) updateData.medicalConditions = medicalConditions;
+    if (isDarkMode !== undefined) updateData.isDarkMode = isDarkMode;
     
     if (password) {
       if (user.googleId && !user.password) {
         return res.status(400).json({ message: 'Social login users cannot set a password this way. Please use Forgot Password or link a password first.' });
       }
-      user.password = password; // will be hashed by pre-save hook
+      const salt = await bcrypt.genSalt(10);
+      updateData.password = await bcrypt.hash(password, salt);
     }
 
-    await user.save();
+    const updatedUser = await prisma.user.update({
+      where: { id: req.user.id },
+      data: updateData
+    });
 
-    const { accessToken, refreshToken } = generateTokens(user._id, user.tokenVersion);
+    const { accessToken, refreshToken } = generateTokens(updatedUser.id, updatedUser.tokenVersion);
     res.json({
-      _id: user.id,
-      name: user.name,
-      email: user.email,
-      age: user.age,
-      skinType: user.skinType,
-      medicalConditions: user.medicalConditions,
-      profilePicture: user.profilePicture,
-      isDarkMode: user.isDarkMode,
+      _id: updatedUser.id,
+      name: updatedUser.name,
+      email: updatedUser.email,
+      age: updatedUser.age,
+      skinType: updatedUser.skinType,
+      medicalConditions: updatedUser.medicalConditions,
+      profilePicture: updatedUser.profilePicture,
+      isDarkMode: updatedUser.isDarkMode,
       token: accessToken,
       refreshToken: refreshToken,
     });
@@ -179,16 +189,13 @@ const updateUser = async (req, res) => {
 // @access  Private
 const deleteUser = async (req, res) => {
   try {
-    const user = await User.findById(req.user.id);
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    // Delete associated lesions
-    await Lesion.deleteMany({ userId: req.user.id });
-    
-    // Delete the user
-    await user.deleteOne();
+    // Prisma's onDelete: Cascade handles deleting associated lesions and scan entries
+    await prisma.user.delete({ where: { id: req.user.id } });
 
     res.json({ message: 'User and all associated data removed' });
   } catch (error) {
@@ -217,20 +224,24 @@ const googleLogin = async (req, res) => {
     const { sub: googleId, email, name } = payload;
 
     // Find or create user
-    let user = await User.findOne({ email });
+    let user = await prisma.user.findUnique({ where: { email } });
 
     if (!user) {
-      user = await User.create({
-        name,
-        email,
-        googleId,
+      user = await prisma.user.create({
+        data: {
+          name,
+          email,
+          googleId,
+        }
       });
     } else if (!user.googleId) {
-      user.googleId = googleId;
-      await user.save();
+      user = await prisma.user.update({
+        where: { email },
+        data: { googleId }
+      });
     }
 
-    const { accessToken, refreshToken } = generateTokens(user._id, user.tokenVersion);
+    const { accessToken, refreshToken } = generateTokens(user.id, user.tokenVersion);
     res.status(200).json({
       _id: user.id,
       name: user.name,
@@ -255,13 +266,15 @@ const uploadProfilePicture = async (req, res) => {
       return res.status(400).json({ message: 'No file uploaded' });
     }
 
-    const user = await User.findById(req.user.id);
+    let user = await prisma.user.findUnique({ where: { id: req.user.id } });
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    user.profilePicture = req.file.path; // Cloudinary URL
-    await user.save();
+    user = await prisma.user.update({
+      where: { id: req.user.id },
+      data: { profilePicture: req.file.path }
+    });
 
     res.json({
       message: 'Profile picture updated successfully',
@@ -284,7 +297,7 @@ const changePassword = async (req, res) => {
       return res.status(400).json({ message: 'Please provide old and new passwords' });
     }
 
-    const user = await User.findById(req.user.id);
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
@@ -298,8 +311,13 @@ const changePassword = async (req, res) => {
       return res.status(401).json({ message: 'Incorrect current password' });
     }
 
-    user.password = newPassword;
-    await user.save();
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+    await prisma.user.update({
+      where: { id: req.user.id },
+      data: { password: hashedPassword }
+    });
 
     res.json({ message: 'Password changed successfully' });
   } catch (error) {
@@ -317,18 +335,23 @@ const forgotPassword = async (req, res) => {
       return res.status(400).json({ message: 'Please provide an email' });
     }
 
-    const user = await User.findOne({ email });
+    const user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
       return res.status(404).json({ message: 'No user found with this email' });
     }
 
     // Generate 6-digit OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const otpExpires = Date.now() + 10 * 60 * 1000; // 10 minutes
+    // Prisma uses Date objects, convert to ISO or Date
+    const otpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
-    user.resetPasswordOTP = otp;
-    user.resetPasswordOTPExpires = otpExpires;
-    await user.save();
+    await prisma.user.update({
+      where: { email },
+      data: {
+        resetPasswordOTP: otp,
+        resetPasswordOTPExpires: otpExpires
+      }
+    });
 
     // Send email
     const mailOptions = {
@@ -368,10 +391,12 @@ const verifyOTP = async (req, res) => {
       return res.status(400).json({ message: 'Please provide email and OTP' });
     }
 
-    const user = await User.findOne({
-      email,
-      resetPasswordOTP: otp,
-      resetPasswordOTPExpires: { $gt: Date.now() },
+    const user = await prisma.user.findFirst({
+      where: {
+        email,
+        resetPasswordOTP: otp,
+        resetPasswordOTPExpires: { gt: new Date() }
+      }
     });
 
     if (!user) {
@@ -394,20 +419,29 @@ const resetPassword = async (req, res) => {
       return res.status(400).json({ message: 'Please provide all fields' });
     }
 
-    const user = await User.findOne({
-      email,
-      resetPasswordOTP: otp,
-      resetPasswordOTPExpires: { $gt: Date.now() },
+    const user = await prisma.user.findFirst({
+      where: {
+        email,
+        resetPasswordOTP: otp,
+        resetPasswordOTPExpires: { gt: new Date() }
+      }
     });
 
     if (!user) {
       return res.status(400).json({ message: 'Invalid or expired OTP' });
     }
 
-    user.password = newPassword;
-    user.resetPasswordOTP = undefined;
-    user.resetPasswordOTPExpires = undefined;
-    await user.save();
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        password: hashedPassword,
+        resetPasswordOTP: null,
+        resetPasswordOTPExpires: null
+      }
+    });
 
     res.json({ message: 'Password reset successful. You can now login.' });
   } catch (error) {
@@ -420,10 +454,12 @@ const resetPassword = async (req, res) => {
 // @access  Private
 const logoutUser = async (req, res) => {
   try {
-    const user = await User.findById(req.user.id);
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
     if (user) {
-      user.tokenVersion += 1;
-      await user.save();
+      await prisma.user.update({
+        where: { id: req.user.id },
+        data: { tokenVersion: { increment: 1 } }
+      });
     }
     res.json({ message: 'Logged out successfully' });
   } catch (error) {
